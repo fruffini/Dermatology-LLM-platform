@@ -14,7 +14,8 @@ ENV/
 .DS_Store
 .idea/
 .vscode/
-
+derm-data/
 # Gradio artifacts
 outputs/
 gradio_cached_examples/
+
