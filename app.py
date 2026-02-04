@@ -19,7 +19,7 @@ from transformers import (
 )
 import threading
 
-OUTPUT_DIR = "outputs/prova_main_conflitto"
+OUTPUT_DIR = "outputs/baseline_vlm_ramo_prova_conflitto"
 var = os.getenv("OUTPUT_DIR")
 if var:
     OUTPUT_DIR = var
