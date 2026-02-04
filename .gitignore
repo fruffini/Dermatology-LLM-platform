@@ -18,6 +18,7 @@ derm-data/
 # Gradio artifacts
 outputs/
 gradio_cached_examples/
-
+conversational-data/ 
 bash/VLM-TOKEN
 SkinGPT-4
+mcqs-lowleve-formatted.json

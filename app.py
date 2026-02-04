@@ -8,12 +8,16 @@ import torch
 from peft import PeftModel
 from PIL import Image
 from transformers import (
+    AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoProcessor,
+    AutoTokenizer,
     MllamaForConditionalGeneration,
     PaliGemmaForConditionalGeneration,
+    TextIteratorStreamer,
     pipeline,
 )
+import threading
 
 OUTPUT_DIR = "outputs"
 MODEL_ROOT = os.path.join("models", "VLM")
@@ -22,6 +26,11 @@ HF_TOKEN = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 
 # Use the second GPU (0-based index) when available.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
 MODEL_REGISTRY = {
     "PaliGemma Derm": {
@@ -56,9 +65,24 @@ MODEL_REGISTRY = {
         "requires_image_token": False,
         "model_type": "text_pipeline",
     },
+    "MedGemma 27B Text": {
+        "model_id": os.getenv("MEDGEMMA_27B_MODEL_ID", "google/medgemma-27b-it"),
+        "base_prompt": "Answer the multiple-choice question with only the best answer label.",
+        "requires_image_token": False,
+        "model_type": "medgemma_text_it",
+    },
 }
 
 _MODEL_CACHE = {}
+
+MCQ_PROMPT_TEMPLATE = (
+    "You are a medical exam assistant. Answer the question using the choices provided.\n"
+    "Return only the single best answer label (e.g., A, B, C) with no extra text.\n\n"
+    "Question:\n{question}\n\n"
+    "Choices:\n{choices}\n\n"
+    "Answer:"
+)
+MCQ_MAX_NEW_TOKENS = int(os.getenv("MCQ_MAX_NEW_TOKENS", "8"))
 
 
 def _safe_slug(value: str) -> str:
@@ -107,6 +131,15 @@ def _load_model(model_name: str):
         )
         _MODEL_CACHE[model_name] = (text_pipe, None)
         return text_pipe, None
+    elif model_type == "medgemma_text_it":
+        model_id = info["model_id"]
+        tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, device_map="auto", token=HF_TOKEN
+        )
+        model.eval()
+        _MODEL_CACHE[model_name] = (tokenizer, model)
+        return tokenizer, model
     else:
         if not HF_TOKEN:
             raise RuntimeError(
@@ -305,76 +338,297 @@ def run_inference(
     return response, path
 
 
+def _format_choices(choices):
+    lines = []
+    for choice in choices or []:
+        label = choice.get("label", "")
+        text = choice.get("text", "")
+        lines.append(f"{label}. {text}".strip())
+    return "\n".join(lines)
+
+
+def _load_mcq_file(file_obj):
+    if not file_obj:
+        return [], []
+    path = getattr(file_obj, "name", None) or file_obj
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    items = data.get("items", [])
+    options = []
+    for item in items:
+        item_id = item.get("id")
+        question = item.get("question", "").replace("\n", " ")
+        label = f"{item_id}: {question[:80]}".strip()
+        options.append((label, item_id))
+    return items, options
+
+
+def _get_mcq_by_id(items, item_id):
+    for item in items:
+        if item.get("id") == item_id:
+            return item
+    return None
+
+
+def _build_mcq_prompt(item):
+    if not item:
+        return ""
+    choices = _format_choices(item.get("choices", []))
+    return MCQ_PROMPT_TEMPLATE.format(question=item.get("question", ""), choices=choices)
+
+
+def _generate_medgemma_text(tokenizer, model, message):
+    messages = [{"role": "user", "content": message}]
+    input_ids = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, return_tensors="pt"
+    ).to(model.device)
+    input_length = input_ids.shape[-1]
+    with torch.inference_mode():
+        outputs = model.generate(
+            input_ids=input_ids,
+            max_new_tokens=MCQ_MAX_NEW_TOKENS,
+            do_sample=False,
+            use_cache=True,
+        )
+    generated_tokens = outputs[0][input_length:]
+    return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+
+def _stream_medgemma_text(tokenizer, model, message):
+    messages = [{"role": "user", "content": message}]
+    input_ids = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, return_tensors="pt"
+    ).to(model.device)
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    generation_kwargs = {
+        "input_ids": input_ids,
+        "max_new_tokens": MCQ_MAX_NEW_TOKENS,
+        "do_sample": False,
+        "use_cache": True,
+        "streamer": streamer,
+    }
+    thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+    partial = ""
+    for token_text in streamer:
+        partial += token_text
+        yield partial.strip()
+    thread.join()
+
+
+def _chat_with_model(history, message, model_name):
+    if not message:
+        return history, ""
+    _unload_other_models(model_name)
+    processor, model = _load_model(model_name)
+    history = history or []
+    model_type = MODEL_REGISTRY[model_name]["model_type"]
+    if model_type == "medgemma_text_it":
+        reply = _generate_medgemma_text(processor, model, message)
+    elif model_type == "text_pipeline":
+        convo_lines = []
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "user":
+                convo_lines.append(f"User: {content}")
+            elif role == "assistant":
+                convo_lines.append(f"Assistant: {content}")
+        convo_lines.append(f"User: {message}")
+        convo_lines.append("Assistant:")
+        prompt = "\n".join(convo_lines)
+        outputs = processor(prompt, max_new_tokens=256)
+    else:
+        messages = history + [{"role": "user", "content": message}]
+        outputs = processor(messages, max_new_tokens=256)
+    generated_text = outputs[0].get("generated_text", "")
+    if isinstance(generated_text, list):
+        last_item = generated_text[-1] if generated_text else ""
+        if isinstance(last_item, dict):
+            reply = last_item.get("content", str(last_item))
+        else:
+            reply = str(last_item)
+    else:
+        reply = str(generated_text)
+        if model_type == "text_pipeline":
+            if reply.startswith(prompt):
+                reply = reply[len(prompt):].strip()
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": reply},
+    ]
+    return history, ""
+
+
+def _chat_with_model_stream(history, message, model_name):
+    if not message:
+        yield history, ""
+        return
+    _unload_other_models(model_name)
+    processor, model = _load_model(model_name)
+    history = history or []
+    model_type = MODEL_REGISTRY[model_name]["model_type"]
+    if model_type == "medgemma_text_it":
+        for partial in _stream_medgemma_text(processor, model, message):
+            yield history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": partial},
+            ], ""
+        return
+    new_history, _ = _chat_with_model(history, message, model_name)
+    yield new_history, ""
+
+
 with gr.Blocks(title="Dermatology VLM Inference") as demo:
     gr.Markdown(
         "# Dermatology VLM Inference\n"
         "Upload a dermatology image, pick a model, and write a prompt."
     )
 
-    with gr.Row():
-        model_choice = gr.Dropdown(
-            label="VLM model",
-            choices=list(MODEL_REGISTRY.keys()),
-            value="PaliGemma Derm",
-        )
-        prompt_input = gr.Textbox(
-            label="Prompt",
-            value=MODEL_REGISTRY["PaliGemma Derm"]["base_prompt"],
-            placeholder="Enter prompt",
-        )
+    with gr.Tabs():
+        with gr.Tab("VLM Inference"):
+            with gr.Row():
+                model_choice = gr.Dropdown(
+                    label="VLM model",
+                    choices=list(MODEL_REGISTRY.keys()),
+                    value="PaliGemma Derm",
+                )
+                prompt_input = gr.Textbox(
+                    label="Prompt",
+                    value=MODEL_REGISTRY["PaliGemma Derm"]["base_prompt"],
+                    placeholder="Enter prompt",
+                )
 
-    image_input = gr.Image(label="Dermatology image", type="filepath")
+            image_input = gr.Image(label="Dermatology image", type="filepath")
 
-    base_prompt_note = gr.Markdown(
-        f"**Suggested prompt**: {MODEL_REGISTRY['PaliGemma Derm']['base_prompt']}"
-    )
-    model_card = gr.Markdown(_load_model_card("PaliGemma Derm"))
+            base_prompt_note = gr.Markdown(
+                f"**Suggested prompt**: {MODEL_REGISTRY['PaliGemma Derm']['base_prompt']}"
+            )
+            model_card = gr.Markdown(_load_model_card("PaliGemma Derm"))
 
-    with gr.Row():
-        save_result = gr.Checkbox(label="Save result", value=True)
-        save_format = gr.Radio(
-            label="Save format",
-            choices=["txt", "json"],
-            value="txt",
-        )
+            with gr.Row():
+                save_result = gr.Checkbox(label="Save result", value=True)
+                save_format = gr.Radio(
+                    label="Save format",
+                    choices=["txt", "json"],
+                    value="txt",
+                )
 
-    run_button = gr.Button("Run inference", variant="primary")
-    clear_button = gr.Button("Clear")
+            run_button = gr.Button("Run inference", variant="primary")
+            clear_button = gr.Button("Clear")
 
-    output_text = gr.Textbox(label="Result", lines=10)
-    output_file = gr.File(label="Saved file")
+            output_text = gr.Textbox(label="Result", lines=10)
+            output_file = gr.File(label="Saved file")
 
-    run_button.click(
-        run_inference,
-        inputs=[model_choice, image_input, prompt_input, save_result, save_format],
-        outputs=[output_text, output_file],
-    )
-    def _on_model_change(name: str):
-        _unload_other_models(name)
-        return (
-            MODEL_REGISTRY[name]["base_prompt"],
-            f"**Suggested prompt**: {MODEL_REGISTRY[name]['base_prompt']}",
-            _load_model_card(name),
-        )
+            run_button.click(
+                run_inference,
+                inputs=[model_choice, image_input, prompt_input, save_result, save_format],
+                outputs=[output_text, output_file],
+            )
 
-    model_choice.change(
-        _on_model_change,
-        inputs=[model_choice],
-        outputs=[prompt_input, base_prompt_note, model_card],
-    )
-    clear_button.click(
-        lambda: (None, MODEL_REGISTRY["PaliGemma Derm"]["base_prompt"], "PaliGemma Derm", True, "txt", "", None),
-        outputs=[
-            image_input,
-            prompt_input,
-            model_choice,
-            save_result,
-            save_format,
-            output_text,
-            output_file,
-        ],
-    )
+            def _on_model_change(name: str):
+                _unload_other_models(name)
+                return (
+                    MODEL_REGISTRY[name]["base_prompt"],
+                    f"**Suggested prompt**: {MODEL_REGISTRY[name]['base_prompt']}",
+                    _load_model_card(name),
+                )
+
+            model_choice.change(
+                _on_model_change,
+                inputs=[model_choice],
+                outputs=[prompt_input, base_prompt_note, model_card],
+            )
+            clear_button.click(
+                lambda: (None, MODEL_REGISTRY["PaliGemma Derm"]["base_prompt"], "PaliGemma Derm", True, "txt", "", None),
+                outputs=[
+                    image_input,
+                    prompt_input,
+                    model_choice,
+                    save_result,
+                    save_format,
+                    output_text,
+                    output_file,
+                ],
+            )
+
+        with gr.Tab("MCQ Chat (MedGemma 27B Text)"):
+            gr.Markdown(
+                "Load a formatted MCQ JSON file, pick a question, and chat. "
+                "The prompt template forces a single answer label."
+            )
+            model_fixed = gr.Textbox(
+                label="Model (fixed)",
+                value="MedGemma 27B Text",
+                interactive=False,
+            )
+            prompt_template = gr.Textbox(
+                label="Prompt template (answer-only)",
+                value=MCQ_PROMPT_TEMPLATE,
+                lines=9,
+                interactive=False,
+            )
+            mcq_file = gr.File(label="MCQ JSON file", file_types=[".json"])
+            load_button = gr.Button("Load questions")
+            mcq_state = gr.State([])
+            question_choice = gr.Dropdown(label="Question", choices=[], value=None)
+            question_preview = gr.Textbox(label="Question preview", lines=6, interactive=False)
+            ask_button = gr.Button("Ask selected question")
+
+            chat = gr.Chatbot(label="Chat")
+            chat_input = gr.Textbox(label="Message", placeholder="Ask a follow-up or request the answer.")
+            send_button = gr.Button("Send", variant="primary")
+            clear_chat = gr.Button("Clear chat")
+
+            def _load_questions(file_obj):
+                items, options = _load_mcq_file(file_obj)
+                return items, gr.update(choices=options, value=options[0][1] if options else None)
+
+            load_button.click(
+                _load_questions,
+                inputs=[mcq_file],
+                outputs=[mcq_state, question_choice],
+            )
+
+            def _show_question(items, item_id):
+                item = _get_mcq_by_id(items, item_id)
+                if not item:
+                    return ""
+                return _build_mcq_prompt(item)
+
+            question_choice.change(
+                _show_question,
+                inputs=[mcq_state, question_choice],
+                outputs=[question_preview],
+            )
+
+            def _send_selected_question_stream(history, items, item_id):
+                item = _get_mcq_by_id(items, item_id)
+                prompt = _build_mcq_prompt(item)
+                if not prompt:
+                    yield history, ""
+                    return
+                yield from _chat_with_model_stream(history, prompt, "MedGemma 27B Text")
+
+            ask_button.click(
+                _send_selected_question_stream,
+                inputs=[chat, mcq_state, question_choice],
+                outputs=[chat, chat_input],
+            )
+
+            send_button.click(
+                _chat_with_model_stream,
+                inputs=[chat, chat_input, model_fixed],
+                outputs=[chat, chat_input],
+            )
+            chat_input.submit(
+                _chat_with_model_stream,
+                inputs=[chat, chat_input, model_fixed],
+                outputs=[chat, chat_input],
+            )
+            clear_chat.click(lambda: [], outputs=[chat])
 
 
 if __name__ == "__main__":
+    demo.queue()
     demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
