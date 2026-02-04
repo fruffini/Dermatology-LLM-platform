@@ -20,10 +20,13 @@ from transformers import (
 import threading
 
 OUTPUT_DIR = "outputs/baseline_vlm_ramo_prova_conflitto"
-var = "prova_conflitto"
+var = os.getenv("OUTPUT_DIR")
+if var:
+    OUTPUT_DIR = var
 MODEL_ROOT = os.path.join("models", "VLM")
 PRIVATE_TOKEN = os.getenv("VLM_PRIVATE_TOKEN", "")
 HF_TOKEN = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+
 
 # Use the second GPU (0-based index) when available.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
