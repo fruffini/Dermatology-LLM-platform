@@ -19,7 +19,10 @@ from transformers import (
 )
 import threading
 
-OUTPUT_DIR = "outputs"
+OUTPUT_DIR = "outputs/prova_main_conflitto"
+var = os.getenv("OUTPUT_DIR")
+if var:
+    OUTPUT_DIR = var
 MODEL_ROOT = os.path.join("models", "VLM")
 PRIVATE_TOKEN = os.getenv("VLM_PRIVATE_TOKEN", "")
 HF_TOKEN = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
