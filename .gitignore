@@ -9,8 +9,8 @@ build/
 .venv/
 venv/
 ENV/
-.derma_env
-.derma_env.*
+.gradio/
+.venv_clinical/
 .DS_Store
 .idea/
 .vscode/

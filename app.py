@@ -12,12 +12,43 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoProcessor,
     AutoTokenizer,
+    BitsAndBytesConfig,
     MllamaForConditionalGeneration,
     PaliGemmaForConditionalGeneration,
     TextIteratorStreamer,
     pipeline,
 )
+from huggingface_hub import InferenceClient
 import threading
+import subprocess
+import time
+import signal
+import requests
+from transformers import StoppingCriteria, StoppingCriteriaList
+from openai import OpenAI
+
+# Global stop event for cancelling generation
+_STOP_GENERATION = threading.Event()
+
+
+class StopOnEvent(StoppingCriteria):
+    """Custom stopping criteria that checks a threading Event."""
+    def __init__(self, stop_event: threading.Event):
+        self.stop_event = stop_event
+
+    def __call__(self, input_ids, scores, **kwargs):
+        return self.stop_event.is_set()
+
+
+def stop_generation():
+    """Signal the model to stop generating."""
+    _STOP_GENERATION.set()
+    return "Generation stopped."
+
+
+def reset_stop_flag():
+    """Reset the stop flag before starting generation."""
+    _STOP_GENERATION.clear()
 
 OUTPUT_DIR = "outputs"
 MODEL_ROOT = os.path.join("models", "VLM")
@@ -30,8 +61,198 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True  # Auto-tune for faster convolutions
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
+
+# Performance optimization flags
+USE_TORCH_COMPILE = os.getenv("USE_TORCH_COMPILE", "0").lower() in ("1", "true", "yes")
+USE_FLASH_ATTENTION = os.getenv("USE_FLASH_ATTENTION", "0").lower() in ("1", "true", "yes")
+ATTN_IMPLEMENTATION = "flash_attention_2" if USE_FLASH_ATTENTION else "sdpa"
+
+# Quantization config for large models (MedGemma 27B)
+# Options: "4bit" (fastest, ~14GB VRAM), "8bit" (~27GB VRAM), "none" (full precision, ~54GB VRAM)
+QUANTIZATION_MODE = os.getenv("QUANTIZATION_MODE", "4bit").lower()
+
+# vLLM server configuration
+VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
+VLLM_HOST = os.getenv("VLLM_HOST", "localhost")
+VLLM_BASE_URL = f"http://{VLLM_HOST}:{VLLM_PORT}/v1"
+VLLM_API_KEY = os.getenv("VLLM_API_KEY", "EMPTY")
+USE_VLLM = os.getenv("USE_VLLM", "1").lower() in ("1", "true", "yes")
+
+# vLLM model configurations
+VLLM_MODEL_CONFIGS = {
+    "MedGemma 27B Text": {
+        "model_id": "google/medgemma-27b-it",
+        "quantization": "bitsandbytes",
+        "load_format": "bitsandbytes",
+        "max_model_len": 4096,
+    },
+    "MedGemma 4B Text": {
+        "model_id": "google/medgemma-4b-it",
+        "quantization": None,
+        "load_format": "auto",
+        "max_model_len": 4096,
+    },
+    "Qwen QwQ-32B": {
+        "model_id": "Qwen/QwQ-32B",
+        "quantization": "bitsandbytes",
+        "load_format": "bitsandbytes",
+        "max_model_len": 4096,
+    },
+    "II-Medical-8B": {
+        "model_id": "Intelligent-Internet/II-Medical-8B",
+        "quantization": None,
+        "load_format": "auto",
+        "max_model_len": 4096,
+    },
+}
+
+
+class VLLMServerManager:
+    """Manages vLLM server lifecycle - starts/stops servers for different models."""
+
+    def __init__(self, host: str = "localhost", port: int = 8000):
+        self.host = host
+        self.port = port
+        self.base_url = f"http://{host}:{port}/v1"
+        self.process = None
+        self.current_model = None
+        self.client = None
+        self._lock = threading.Lock()
+
+    def _kill_existing_vllm(self):
+        """Kill any existing vLLM processes on the port."""
+        try:
+            # Kill by port
+            subprocess.run(
+                f"lsof -ti:{self.port} | xargs -r kill -9",
+                shell=True, capture_output=True, timeout=10
+            )
+            # Also kill by name
+            subprocess.run(
+                "pkill -9 -f 'vllm serve'",
+                shell=True, capture_output=True, timeout=10
+            )
+            time.sleep(2)
+        except Exception:
+            pass
+
+    def _wait_for_server(self, timeout: int = 300) -> bool:
+        """Wait for vLLM server to be ready."""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                response = requests.get(f"http://{self.host}:{self.port}/health", timeout=5)
+                if response.status_code == 200:
+                    return True
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(2)
+        return False
+
+    def start_server(self, model_name: str) -> bool:
+        """Start vLLM server for the specified model."""
+        with self._lock:
+            if self.current_model == model_name and self.is_running():
+                return True
+
+            config = VLLM_MODEL_CONFIGS.get(model_name)
+            if not config:
+                return False
+
+            # Stop existing server
+            self.stop_server()
+
+            # Build vLLM command
+            cmd = [
+                "vllm", "serve", config["model_id"],
+                "--dtype", "bfloat16",
+                "--max-model-len", str(config["max_model_len"]),
+                "--enforce-eager",
+                "--disable-custom-all-reduce",
+                "--host", self.host,
+                "--port", str(self.port),
+                "--gpu-memory-utilization", "0.9",
+            ]
+
+            if config["quantization"]:
+                cmd.extend(["--quantization", config["quantization"]])
+            if config["load_format"] != "auto":
+                cmd.extend(["--load-format", config["load_format"]])
+
+            # Start server process
+            env = os.environ.copy()
+            env["VLLM_USE_TRITON_FLASH_ATTN"] = "0"
+
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                preexec_fn=os.setsid,
+            )
+
+            # Wait for server to be ready
+            if self._wait_for_server():
+                self.current_model = model_name
+                self.client = OpenAI(base_url=self.base_url, api_key=VLLM_API_KEY)
+                return True
+            else:
+                self.stop_server()
+                return False
+
+    def stop_server(self):
+        """Stop the vLLM server."""
+        with self._lock:
+            if self.process:
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                    self.process.wait(timeout=10)
+                except Exception:
+                    try:
+                        os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+                self.process = None
+
+            self._kill_existing_vllm()
+            self.current_model = None
+            self.client = None
+
+    def is_running(self) -> bool:
+        """Check if vLLM server is running."""
+        if not self.process:
+            return False
+        try:
+            response = requests.get(f"http://{self.host}:{self.port}/health", timeout=2)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def get_client(self):
+        """Get the OpenAI client for the running server."""
+        return self.client
+
+
+# Global vLLM server manager
+_VLLM_MANAGER = VLLMServerManager(host=VLLM_HOST, port=VLLM_PORT) if USE_VLLM else None
+
+def _get_quantization_config():
+    """Get BitsAndBytes quantization config based on QUANTIZATION_MODE."""
+    if QUANTIZATION_MODE == "4bit":
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+    elif QUANTIZATION_MODE == "8bit":
+        return BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+    return None
 
 MODEL_REGISTRY = {
     "PaliGemma Derm": {
@@ -67,10 +288,28 @@ MODEL_REGISTRY = {
         "model_type": "text_pipeline",
     },
     "MedGemma 27B Text": {
-        "model_id": os.getenv("MEDGEMMA_27B_MODEL_ID", "google/medgemma-27b-it"),
+        "model_id": "google/medgemma-27b-it",
         "base_prompt": "Answer the multiple-choice question with only the best answer label.",
         "requires_image_token": False,
-        "model_type": "medgemma_text_it",
+        "model_type": "vllm",  # Uses vLLM server for fast inference
+    },
+    "MedGemma 4B Text": {
+        "model_id": "google/medgemma-4b-it",
+        "base_prompt": "Answer the multiple-choice question with only the best answer label.",
+        "requires_image_token": False,
+        "model_type": "vllm",
+    },
+    "II-Medical-8B": {
+        "model_id": "Intelligent-Internet/II-Medical-8B",
+        "base_prompt": "Answer the multiple-choice question with only the best answer label.",
+        "requires_image_token": False,
+        "model_type": "vllm",
+    },
+    "Qwen QwQ-32B": {
+        "model_id": "Qwen/QwQ-32B",
+        "base_prompt": "Answer the multiple-choice question with only the best answer label.",
+        "requires_image_token": False,
+        "model_type": "vllm",
     },
 }
 
@@ -84,6 +323,18 @@ MCQ_PROMPT_TEMPLATE = (
     "Answer:"
 )
 MCQ_MAX_NEW_TOKENS = int(os.getenv("MCQ_MAX_NEW_TOKENS", "8"))
+
+HISTORY_TAKING_PROMPT_TEMPLATE = (
+    "You are an experienced physician conducting a diagnostic interview.\n"
+    "Based on the patient's description of their symptoms, provide:\n"
+    "1. The most likely diagnosis\n"
+    "2. Key clinical features that support this diagnosis\n"
+    "3. Important differential diagnoses to consider\n"
+    "4. Any red flags or warning signs mentioned\n\n"
+    "Patient's description:\n\"{symptoms}\"\n\n"
+    "Analysis:"
+)
+HISTORY_TAKING_MAX_NEW_TOKENS = int(os.getenv("HISTORY_TAKING_MAX_NEW_TOKENS", "512"))
 
 
 def _safe_slug(value: str) -> str:
@@ -101,6 +352,13 @@ def _image_summary(image_path: str) -> str:
         return "unknown"
 
 
+def _maybe_compile(model):
+    """Apply torch.compile if enabled via USE_TORCH_COMPILE env var."""
+    if USE_TORCH_COMPILE and hasattr(torch, "compile"):
+        return torch.compile(model, mode="reduce-overhead")
+    return model
+
+
 def _load_model(model_name: str):
     if model_name in _MODEL_CACHE:
         return _MODEL_CACHE[model_name]
@@ -111,16 +369,26 @@ def _load_model(model_name: str):
         model_id = info["model_id"]
         processor = AutoProcessor.from_pretrained(model_id, token=HF_TOKEN)
         model = PaliGemmaForConditionalGeneration.from_pretrained(
-            model_id, device_map={"": 0}, token=HF_TOKEN
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map={"": 0},
+            attn_implementation=ATTN_IMPLEMENTATION,
+            token=HF_TOKEN,
         )
         model.eval()
+        model = _maybe_compile(model)
     elif model_type == "medgemma_it":
         model_id = info["model_id"]
         processor = AutoProcessor.from_pretrained(model_id, token=HF_TOKEN)
         model = AutoModelForImageTextToText.from_pretrained(
-            model_id, dtype=torch.bfloat16, device_map="auto", token=HF_TOKEN
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation=ATTN_IMPLEMENTATION,
+            token=HF_TOKEN,
         )
         model.eval()
+        model = _maybe_compile(model)
     elif model_type == "text_pipeline":
         model_id = info["model_id"]
         text_pipe = pipeline(
@@ -135,12 +403,30 @@ def _load_model(model_name: str):
     elif model_type == "medgemma_text_it":
         model_id = info["model_id"]
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, device_map="auto", token=HF_TOKEN
-        )
+        quant_config = _get_quantization_config()
+        model_kwargs = {
+            "device_map": "auto",
+            "token": HF_TOKEN,
+            "low_cpu_mem_usage": True,  # Faster loading
+        }
+        if quant_config:
+            # Quantized models: don't use custom attention implementation
+            model_kwargs["quantization_config"] = quant_config
+        else:
+            # Full precision: use optimized attention and dtype
+            model_kwargs["torch_dtype"] = torch.bfloat16
+            model_kwargs["attn_implementation"] = ATTN_IMPLEMENTATION
+        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
         model.eval()
+        # Note: torch.compile may not work well with quantized models
+        if not quant_config:
+            model = _maybe_compile(model)
         _MODEL_CACHE[model_name] = (tokenizer, model)
         return tokenizer, model
+    elif model_type == "inference_client":
+        client = InferenceClient(api_key=HF_TOKEN)
+        _MODEL_CACHE[model_name] = (client, info["model_id"])
+        return client, info["model_id"]
     else:
         if not HF_TOKEN:
             raise RuntimeError(
@@ -149,10 +435,15 @@ def _load_model(model_name: str):
         base_model_name = info["model_id"]
         processor = AutoProcessor.from_pretrained(base_model_name, token=HF_TOKEN)
         model = MllamaForConditionalGeneration.from_pretrained(
-            base_model_name, torch_dtype=torch.bfloat16, device_map="auto", token=HF_TOKEN
+            base_model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation=ATTN_IMPLEMENTATION,
+            token=HF_TOKEN,
         )
         model = PeftModel.from_pretrained(model, info["adapter_id"], token=HF_TOKEN)
         model.eval()
+        model = _maybe_compile(model)
 
     _MODEL_CACHE[model_name] = (processor, model)
     return processor, model
@@ -212,8 +503,8 @@ def run_inference(
             return_tensors="pt",
             padding="longest",
         ).to(device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=80)
+        with torch.inference_mode():
+            outputs = model.generate(**inputs, max_new_tokens=80, use_cache=True)
         input_length = inputs["input_ids"].shape[-1]
         generated_ids = outputs[0][input_length:]
         decoded_output = processor.decode(generated_ids, skip_special_tokens=True)
@@ -248,6 +539,7 @@ def run_inference(
                 **inputs,
                 max_new_tokens=300,
                 do_sample=False,
+                use_cache=True,
             )
         generated_tokens = outputs[0][input_length:]
         decoded_output = processor.decode(generated_tokens, skip_special_tokens=True)
@@ -285,9 +577,10 @@ def run_inference(
             "do_sample": True,
             "temperature": 0.7,
             "top_p": 0.95,
+            "use_cache": True,
         }
         input_length = inputs.input_ids.shape[1]
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.generate(
                 **inputs,
                 **generation_config,
@@ -378,43 +671,176 @@ def _build_mcq_prompt(item):
     return MCQ_PROMPT_TEMPLATE.format(question=item.get("question", ""), choices=choices)
 
 
+def _load_history_taking_file(file_obj):
+    if not file_obj:
+        return [], []
+    path = getattr(file_obj, "name", None) or file_obj
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    items = data.get("items", [])
+    options = []
+    for item in items:
+        item_id = item.get("id")
+        question = item.get("question", "").replace("\n", " ")
+        label = f"{item_id}: {question[:80]}".strip()
+        options.append((label, item_id))
+    return items, options
+
+
+def _get_history_case_by_id(items, item_id):
+    for item in items:
+        if item.get("id") == item_id:
+            return item
+    return None
+
+
+def _build_history_taking_prompt(item):
+    if not item:
+        return ""
+    symptoms = item.get("question", "")
+    return HISTORY_TAKING_PROMPT_TEMPLATE.format(symptoms=symptoms)
+
+
 def _generate_medgemma_text(tokenizer, model, message):
     messages = [{"role": "user", "content": message}]
     input_ids = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, return_tensors="pt"
     ).to(model.device)
     input_length = input_ids.shape[-1]
+    # Ensure pad_token_id is set
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     with torch.inference_mode():
         outputs = model.generate(
             input_ids=input_ids,
             max_new_tokens=MCQ_MAX_NEW_TOKENS,
             do_sample=False,
             use_cache=True,
+            pad_token_id=pad_token_id,
         )
     generated_tokens = outputs[0][input_length:]
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
 
-def _stream_medgemma_text(tokenizer, model, message):
+def _stream_medgemma_text(tokenizer, model, message, max_tokens=None):
+    if max_tokens is None:
+        max_tokens = MCQ_MAX_NEW_TOKENS
+    reset_stop_flag()
     messages = [{"role": "user", "content": message}]
     input_ids = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, return_tensors="pt"
     ).to(model.device)
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    # Ensure pad_token_id is set
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    # Custom stopping criteria for cancellation
+    stop_criteria = StoppingCriteriaList([StopOnEvent(_STOP_GENERATION)])
     generation_kwargs = {
         "input_ids": input_ids,
-        "max_new_tokens": MCQ_MAX_NEW_TOKENS,
+        "max_new_tokens": max_tokens,
         "do_sample": False,
         "use_cache": True,
         "streamer": streamer,
+        "pad_token_id": pad_token_id,
+        "stopping_criteria": stop_criteria,
     }
     thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
     thread.start()
     partial = ""
     for token_text in streamer:
+        if _STOP_GENERATION.is_set():
+            break
         partial += token_text
         yield partial.strip()
     thread.join()
+
+
+def _generate_inference_client(client, model_id, message, max_tokens=256):
+    completion = client.chat.completions.create(
+        model=model_id,
+        messages=[{"role": "user", "content": message}],
+        max_tokens=max_tokens,
+    )
+    return completion.choices[0].message.content.strip()
+
+
+def _stream_inference_client(client, model_id, message, max_tokens=256):
+    import time
+    reset_stop_flag()
+    max_retries = 3
+    retry_delay = 2
+
+    for attempt in range(max_retries):
+        try:
+            stream = client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "user", "content": message}],
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            partial = ""
+            for chunk in stream:
+                if _STOP_GENERATION.is_set():
+                    break
+                if chunk.choices and chunk.choices[0].delta.content:
+                    partial += chunk.choices[0].delta.content
+                    yield partial.strip()
+            return  # Success, exit the retry loop
+        except Exception as e:
+            error_msg = str(e)
+            if "502" in error_msg or "503" in error_msg or "504" in error_msg:
+                if attempt < max_retries - 1:
+                    yield f"⏳ Server busy, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})"
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    yield f"❌ Server error after {max_retries} attempts: {error_msg}\n\nThe HuggingFace Inference API for this model is currently unavailable. Try again later or use a different model."
+            else:
+                yield f"❌ Error: {error_msg}"
+                return
+
+
+def _stream_vllm(model_name: str, message: str, max_tokens: int = 256):
+    """Stream generation using vLLM server with automatic server management."""
+    if not _VLLM_MANAGER:
+        yield "❌ vLLM is disabled. Set USE_VLLM=1 to enable."
+        return
+
+    reset_stop_flag()
+
+    # Check if we need to start/switch the server
+    if _VLLM_MANAGER.current_model != model_name:
+        yield f"🔄 Starting vLLM server for {model_name}... (this may take a few minutes)"
+
+        if not _VLLM_MANAGER.start_server(model_name):
+            yield f"❌ Failed to start vLLM server for {model_name}. Check logs for details."
+            return
+
+        yield f"✅ vLLM server ready for {model_name}"
+
+    client = _VLLM_MANAGER.get_client()
+    if not client:
+        yield "❌ vLLM client not available."
+        return
+
+    model_id = VLLM_MODEL_CONFIGS.get(model_name, {}).get("model_id", model_name)
+
+    try:
+        stream = client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": message}],
+            max_tokens=max_tokens,
+            stream=True,
+            temperature=0,
+        )
+        partial = ""
+        for chunk in stream:
+            if _STOP_GENERATION.is_set():
+                break
+            if chunk.choices and chunk.choices[0].delta.content:
+                partial += chunk.choices[0].delta.content
+                yield partial.strip()
+    except Exception as e:
+        yield f"❌ vLLM error: {str(e)}"
 
 
 def _chat_with_model(history, message, model_name):
@@ -461,21 +887,43 @@ def _chat_with_model(history, message, model_name):
     return history, ""
 
 
-def _chat_with_model_stream(history, message, model_name):
+def _chat_with_model_stream(history, message, model_name, max_tokens=None):
     if not message:
         yield history, ""
         return
-    _unload_other_models(model_name)
-    processor, model = _load_model(model_name)
     history = history or []
     model_type = MODEL_REGISTRY[model_name]["model_type"]
-    if model_type == "medgemma_text_it":
-        for partial in _stream_medgemma_text(processor, model, message):
+    tokens = max_tokens if max_tokens else 256
+
+    # Use vLLM for supported models (automatic server management)
+    if model_type == "vllm" and _VLLM_MANAGER:
+        for partial in _stream_vllm(model_name, message, tokens):
             yield history + [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": partial},
             ], ""
         return
+
+    # Fallback to local inference or inference client
+    _unload_other_models(model_name)
+    processor, model = _load_model(model_name)
+
+    if model_type == "medgemma_text_it":
+        for partial in _stream_medgemma_text(processor, model, message, max_tokens):
+            yield history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": partial},
+            ], ""
+        return
+
+    if model_type == "inference_client":
+        for partial in _stream_inference_client(processor, model, message, tokens):
+            yield history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": partial},
+            ], ""
+        return
+
     new_history, _ = _chat_with_model(history, message, model_name)
     yield new_history, ""
 
@@ -553,15 +1001,15 @@ with gr.Blocks(title="Dermatology VLM Inference") as demo:
                 ],
             )
 
-        with gr.Tab("MCQ Chat (MedGemma 27B Text)"):
+        with gr.Tab("MCQ Chat"):
             gr.Markdown(
                 "Load a formatted MCQ JSON file, pick a question, and chat. "
                 "The prompt template forces a single answer label."
             )
-            model_fixed = gr.Textbox(
-                label="Model (fixed)",
-                value="MedGemma 27B Text",
-                interactive=False,
+            mcq_model_choice = gr.Dropdown(
+                label="Model",
+                choices=["MedGemma 4B Text", "MedGemma 27B Text", "II-Medical-8B", "Qwen QwQ-32B"],
+                value="MedGemma 4B Text",
             )
             prompt_template = gr.Textbox(
                 label="Prompt template (answer-only)",
@@ -578,8 +1026,10 @@ with gr.Blocks(title="Dermatology VLM Inference") as demo:
 
             chat = gr.Chatbot(label="Chat")
             chat_input = gr.Textbox(label="Message", placeholder="Ask a follow-up or request the answer.")
-            send_button = gr.Button("Send", variant="primary")
-            clear_chat = gr.Button("Clear chat")
+            with gr.Row():
+                send_button = gr.Button("Send", variant="primary")
+                stop_button = gr.Button("Stop", variant="stop")
+                clear_chat = gr.Button("Clear chat")
 
             def _load_questions(file_obj):
                 items, options = _load_mcq_file(file_obj)
@@ -603,31 +1053,120 @@ with gr.Blocks(title="Dermatology VLM Inference") as demo:
                 outputs=[question_preview],
             )
 
-            def _send_selected_question_stream(history, items, item_id):
+            def _send_selected_question_stream(history, items, item_id, model_name):
                 item = _get_mcq_by_id(items, item_id)
                 prompt = _build_mcq_prompt(item)
                 if not prompt:
                     yield history, ""
                     return
-                yield from _chat_with_model_stream(history, prompt, "MedGemma 27B Text")
+                yield from _chat_with_model_stream(history, prompt, model_name)
 
             ask_button.click(
                 _send_selected_question_stream,
-                inputs=[chat, mcq_state, question_choice],
+                inputs=[chat, mcq_state, question_choice, mcq_model_choice],
                 outputs=[chat, chat_input],
             )
 
             send_button.click(
                 _chat_with_model_stream,
-                inputs=[chat, chat_input, model_fixed],
+                inputs=[chat, chat_input, mcq_model_choice],
                 outputs=[chat, chat_input],
+            )
+            stop_button.click(
+                stop_generation,
+                outputs=[],
             )
             chat_input.submit(
                 _chat_with_model_stream,
-                inputs=[chat, chat_input, model_fixed],
+                inputs=[chat, chat_input, mcq_model_choice],
                 outputs=[chat, chat_input],
             )
             clear_chat.click(lambda: [], outputs=[chat])
+
+        with gr.Tab("History Taking Cases"):
+            gr.Markdown(
+                "Load a history-taking cases JSON file, pick a case, and get diagnostic analysis. "
+                "The model will analyze the patient's symptoms and provide a differential diagnosis."
+            )
+            ht_model_choice = gr.Dropdown(
+                label="Model",
+                choices=["MedGemma 4B Text", "MedGemma 27B Text", "II-Medical-8B", "Qwen QwQ-32B"],
+                value="MedGemma 4B Text",
+            )
+            ht_prompt_template = gr.Textbox(
+                label="Prompt template (diagnostic reasoning)",
+                value=HISTORY_TAKING_PROMPT_TEMPLATE,
+                lines=12,
+                interactive=False,
+            )
+            ht_file = gr.File(label="History Taking JSON file", file_types=[".json"])
+            ht_load_button = gr.Button("Load cases")
+            ht_state = gr.State([])
+            ht_case_choice = gr.Dropdown(label="Case", choices=[], value=None)
+            ht_case_preview = gr.Textbox(label="Patient description", lines=4, interactive=False)
+            ht_ask_button = gr.Button("Analyze symptoms")
+
+            ht_chat = gr.Chatbot(label="Diagnostic Analysis")
+            ht_chat_input = gr.Textbox(label="Follow-up question", placeholder="Ask follow-up questions about the diagnosis.")
+            with gr.Row():
+                ht_send_button = gr.Button("Send", variant="primary")
+                ht_stop_button = gr.Button("Stop", variant="stop")
+                ht_clear_chat = gr.Button("Clear chat")
+
+            def _load_ht_cases(file_obj):
+                items, options = _load_history_taking_file(file_obj)
+                return items, gr.update(choices=options, value=options[0][1] if options else None)
+
+            ht_load_button.click(
+                _load_ht_cases,
+                inputs=[ht_file],
+                outputs=[ht_state, ht_case_choice],
+            )
+
+            def _show_ht_case(items, item_id):
+                item = _get_history_case_by_id(items, item_id)
+                if not item:
+                    return ""
+                return item.get("question", "")
+
+            ht_case_choice.change(
+                _show_ht_case,
+                inputs=[ht_state, ht_case_choice],
+                outputs=[ht_case_preview],
+            )
+
+            def _send_ht_case_stream(history, items, item_id, model_name):
+                item = _get_history_case_by_id(items, item_id)
+                prompt = _build_history_taking_prompt(item)
+                if not prompt:
+                    yield history, ""
+                    return
+                yield from _chat_with_model_stream(history, prompt, model_name, HISTORY_TAKING_MAX_NEW_TOKENS)
+
+            ht_ask_button.click(
+                _send_ht_case_stream,
+                inputs=[ht_chat, ht_state, ht_case_choice, ht_model_choice],
+                outputs=[ht_chat, ht_chat_input],
+            )
+
+            def _ht_chat_stream(history, message, model_name):
+                yield from _chat_with_model_stream(history, message, model_name, HISTORY_TAKING_MAX_NEW_TOKENS)
+
+            ht_send_button.click(
+                _ht_chat_stream,
+                inputs=[ht_chat, ht_chat_input, ht_model_choice],
+                outputs=[ht_chat, ht_chat_input],
+            )
+            ht_stop_button.click(
+                stop_generation,
+                outputs=[],
+            )
+            ht_chat_input.submit(
+                _ht_chat_stream,
+                inputs=[ht_chat, ht_chat_input, ht_model_choice],
+                outputs=[ht_chat, ht_chat_input],
+            )
+            ht_clear_chat.click(lambda: [], outputs=[ht_chat])
 
 
 if __name__ == "__main__":
