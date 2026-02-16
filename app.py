@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
 from datetime import datetime
 
 import gradio as gr
@@ -56,8 +57,6 @@ PRIVATE_TOKEN = os.getenv("VLM_PRIVATE_TOKEN", "")
 HF_TOKEN = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 
 
-# Use the second GPU (0-based index) when available.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -80,6 +79,8 @@ VLLM_HOST = os.getenv("VLLM_HOST", "localhost")
 VLLM_BASE_URL = f"http://{VLLM_HOST}:{VLLM_PORT}/v1"
 VLLM_API_KEY = os.getenv("VLLM_API_KEY", "EMPTY")
 USE_VLLM = os.getenv("USE_VLLM", "1").lower() in ("1", "true", "yes")
+VLLM_LOG_DIR = os.getenv("VLLM_LOG_DIR", os.path.join(OUTPUT_DIR, "vllm_logs"))
+VLLM_WORKDIR = os.getenv("VLLM_WORKDIR", os.getcwd())
 
 # vLLM model configurations
 VLLM_MODEL_CONFIGS = {
@@ -120,7 +121,35 @@ class VLLMServerManager:
         self.process = None
         self.current_model = None
         self.client = None
-        self._lock = threading.Lock()
+        self.last_start_error = None
+        self.last_log_path = None
+        self._log_file = None
+        self._lock = threading.RLock()
+
+    def _close_log_file(self):
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
+
+    def _prepare_log_file(self, model_name: str):
+        os.makedirs(VLLM_LOG_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = "".join(ch.lower() if ch.isalnum() else "_" for ch in model_name).strip("_")
+        self.last_log_path = os.path.join(VLLM_LOG_DIR, f"{safe_name}_{timestamp}.log")
+        self._log_file = open(self.last_log_path, "w", encoding="utf-8", buffering=1)
+
+    def _tail_log(self, lines: int = 20) -> str:
+        if not self.last_log_path or not os.path.exists(self.last_log_path):
+            return ""
+        try:
+            with open(self.last_log_path, "r", encoding="utf-8") as fh:
+                data = fh.readlines()
+            return "".join(data[-lines:]).strip()
+        except Exception:
+            return ""
 
     def _kill_existing_vllm(self):
         """Kill any existing vLLM processes on the port."""
@@ -143,6 +172,13 @@ class VLLMServerManager:
         """Wait for vLLM server to be ready."""
         start_time = time.time()
         while time.time() - start_time < timeout:
+            if self.process and self.process.poll() is not None:
+                return_code = self.process.returncode
+                log_tail = self._tail_log()
+                self.last_start_error = f"vLLM exited with code {return_code}."
+                if log_tail:
+                    self.last_start_error += f" Last log lines:\n{log_tail}"
+                return False
             try:
                 response = requests.get(f"http://{self.host}:{self.port}/health", timeout=5)
                 if response.status_code == 200:
@@ -155,6 +191,7 @@ class VLLMServerManager:
     def start_server(self, model_name: str) -> bool:
         """Start vLLM server for the specified model."""
         with self._lock:
+            self.last_start_error = None
             if self.current_model == model_name and self.is_running():
                 return True
 
@@ -168,6 +205,7 @@ class VLLMServerManager:
             # Build vLLM command
             cmd = [
                 "vllm", "serve", config["model_id"],
+                "--device", "cuda",
                 "--dtype", "bfloat16",
                 "--max-model-len", str(config["max_model_len"]),
                 "--enforce-eager",
@@ -185,14 +223,30 @@ class VLLMServerManager:
             # Start server process
             env = os.environ.copy()
             env["VLLM_USE_TRITON_FLASH_ATTN"] = "0"
-
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=env,
-                preexec_fn=os.setsid,
+            # Pin vLLM to physical GPU 1 on this machine.
+            env["CUDA_VISIBLE_DEVICES"] = "1"
+            self._close_log_file()
+            self._prepare_log_file(model_name)
+            self._log_file.write(
+                f"[{datetime.now().isoformat()}] Starting vLLM for {model_name}\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"Working directory: {VLLM_WORKDIR}\n\n"
             )
+
+            try:
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=self._log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=VLLM_WORKDIR,
+                    env=env,
+                    preexec_fn=os.setsid,
+                )
+            except Exception as exc:
+                self.last_start_error = str(exc)
+                self._close_log_file()
+                self.process = None
+                return False
 
             # Wait for server to be ready
             if self._wait_for_server():
@@ -217,6 +271,7 @@ class VLLMServerManager:
                         pass
                 self.process = None
 
+            self._close_log_file()
             self._kill_existing_vllm()
             self.current_model = None
             self.client = None
@@ -812,7 +867,13 @@ def _stream_vllm(model_name: str, message: str, max_tokens: int = 256):
         yield f"🔄 Starting vLLM server for {model_name}... (this may take a few minutes)"
 
         if not _VLLM_MANAGER.start_server(model_name):
-            yield f"❌ Failed to start vLLM server for {model_name}. Check logs for details."
+            error_details = _VLLM_MANAGER.last_start_error or "No startup error captured."
+            log_path = _VLLM_MANAGER.last_log_path or "(log file not created)"
+            yield (
+                f"❌ Failed to start vLLM server for {model_name}.\n"
+                f"Log file: {log_path}\n"
+                f"Details: {error_details}"
+            )
             return
 
         yield f"✅ vLLM server ready for {model_name}"
